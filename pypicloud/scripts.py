@@ -267,3 +267,35 @@ def import_access(argv=None):
     transaction.commit()
     if result is not None:
         print result
+
+
+def refresh_path(argv=None):
+    """Update the cached info from storage for the given path."""
+    if argv is None:
+        argv = sys.argv[1:]
+
+    parser = argparse.ArgumentParser(
+        description=import_access.__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        '-q',
+        '--quiet',
+        action='store_true',
+        default=False,
+        help="Produce no output on success",
+    )
+    parser.add_argument(
+        'config',
+        help="Name of config file",
+    )
+    parser.add_argument(
+        'path',
+        help="Path of the file to refresh on the cache",
+    )
+    args = parser.parse_args(argv)
+
+    logging.basicConfig()
+    bootstrap(args.config)['request'].db.reload_path(args.path)
+    if not args.quiet:
+        print "Reloaded " + args.path

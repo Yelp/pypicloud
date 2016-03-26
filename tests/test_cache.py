@@ -1,26 +1,68 @@
 # -*- coding: utf-8 -*-
 """ Tests for database cache implementations """
 import sys
+import threading
 import transaction
-import calendar
+from contextlib import contextmanager
+from datetime import datetime
+from functools import wraps
 from redis import ConnectionError
 from mock import MagicMock, patch, ANY
 from pyramid.testing import DummyRequest
 from sqlalchemy.exc import OperationalError
+from pytz import UTC
 
 from . import DummyCache, DummyStorage, make_package
 from dynamo3 import Throughput
-from flywheel.fields.types import UTC
 from pypicloud.cache import ICache, SQLCache, RedisCache
 from pypicloud.cache.dynamo import DynamoCache, DynamoPackage, PackageSummary
 from pypicloud.cache.sql import SQLPackage
 from pypicloud.storage import IStorage
+from pypicloud.util import dt2ts
 
 
 try:
     import unittest2 as unittest  # pylint: disable=F0401
 except ImportError:
     import unittest
+
+
+@contextmanager
+def reload_in_another_thread(cache):
+    """ Spawn another thread that calls `reload_from_storage`. The provided
+    code block will be run after calculating the actions but before enacting
+    them. """
+
+    ready = threading.Event()
+    done = threading.Event()
+    patcher = patch('pypicloud.cache.dynamo.calculate_package_updates')
+    original, _ = patcher.get_original()
+
+    @wraps(original)
+    def original_and_lock(*args, **kwargs):
+        """ Shim to sync """
+        try:
+            return original(*args, **kwargs)
+        finally:
+            ready.set()
+            done.wait()
+
+    with patcher as mock_func:
+        mock_func.side_effect = original_and_lock
+
+        t = threading.Thread(target=cache.reload_from_storage)
+        t.start()
+
+        ready.wait()
+        try:
+            yield
+        finally:
+            done.set()
+
+        t.join(timeout=5)
+        if t.is_alive():
+            # We've done our best. Just set it loose.
+            t.daemon = True
 
 
 class TestBaseCache(unittest.TestCase):
@@ -235,15 +277,17 @@ class TestSQLiteCache(unittest.TestCase):
 
     def test_reload(self):
         """ reload_from_storage() inserts packages into the database """
-        keys = [
-            make_package(factory=SQLPackage),
-            make_package('mypkg2', '1.3.4', 'my/other/path',
-                         factory=SQLPackage),
+        pkgs = [
+            make_package('mypkg', '1.1', factory=SQLPackage),
+            make_package('mypkg2', '1.3.4', factory=SQLPackage),
+            make_package('mypkg2', '1.3.5', factory=SQLPackage),
         ]
-        self.storage.list.return_value = keys
+        self.db.save(pkgs[0])
+        self.db.save(pkgs[1])
+        self.storage.list.return_value = pkgs[1:]
         self.db.reload_from_storage()
         all_pkgs = self.sql.query(SQLPackage).all()
-        self.assertItemsEqual(all_pkgs, keys)
+        self.assertItemsEqual(all_pkgs, pkgs[1:])
 
     def test_fetch(self):
         """ fetch() retrieves a package from the database """
@@ -300,11 +344,11 @@ class TestSQLiteCache(unittest.TestCase):
         # last_modified may be rounded when stored in MySQL,
         # so the best we can do is make sure they're close.
         self.assertTrue(
-            calendar.timegm(s1['last_modified'].timetuple()) -
-            calendar.timegm(p1.last_modified.timetuple()) <= 1)
+            dt2ts(s1['last_modified']) - dt2ts(p1.last_modified) <= 1,
+        )
         self.assertTrue(
-            calendar.timegm(s2['last_modified'].timetuple()) -
-            calendar.timegm(p2.last_modified.timetuple()) <= 1)
+            dt2ts(s2['last_modified']) - dt2ts(p2.last_modified) <= 1,
+        )
 
     def test_multiple_packages_same_version(self):
         """ Can upload multiple packages that have the same version """
@@ -384,11 +428,15 @@ class TestRedisCache(unittest.TestCase):
             'name': pkg.name,
             'version': pkg.version,
             'filename': pkg.filename,
-            'last_modified': pkg.last_modified.strftime('%s.%f'),
+            'last_modified': str(dt2ts(pkg.last_modified)),
         }
         pkg_data.update(pkg.data)
 
         self.assertEqual(data, pkg_data)
+
+    def assert_not_in_redis(self, pkg):
+        """ Assert that a package does not exist in redis """
+        self.assertFalse(self.redis.sismember(self.db.redis_set, pkg.name))
 
     def test_load(self):
         """ Loading from redis deserializes all fields """
@@ -403,7 +451,9 @@ class TestRedisCache(unittest.TestCase):
         self.assertEqual(loaded.name, pkg.name)
         self.assertEqual(loaded.version, pkg.version)
         self.assertEqual(loaded.filename, pkg.filename)
-        self.assertEqual(loaded.last_modified, pkg.last_modified)
+        self.assertTrue(
+            dt2ts(loaded.last_modified) - dt2ts(pkg.last_modified) <= 1,
+        )
         self.assertEqual(loaded.data, kwargs)
 
     def test_delete(self):
@@ -457,15 +507,18 @@ class TestRedisCache(unittest.TestCase):
 
     def test_reload(self):
         """ reload_from_storage() inserts packages into the database """
-        keys = [
-            make_package(factory=SQLPackage),
-            make_package('mypkg2', '1.3.4', 'my/other/path',
-                         factory=SQLPackage),
+        pkgs = [
+            make_package('mypkg', '1.1'),
+            make_package('mypkg2', '1.3.4'),
+            make_package('mypkg2', '1.3.5'),
         ]
-        self.storage.list.return_value = keys
+        self.db.save(pkgs[0])
+        self.db.save(pkgs[1])
+        self.storage.list.return_value = pkgs[1:]
         self.db.reload_from_storage()
-        for pkg in keys:
+        for pkg in pkgs[1:]:
             self.assert_in_redis(pkg)
+        self.assert_not_in_redis(pkgs[0])
 
     def test_fetch(self):
         """ fetch() retrieves a package from the database """
@@ -566,6 +619,12 @@ class TestDynamoCache(unittest.TestCase):
             summary.update_with(pkg)
             self.engine.sync(summary)
 
+        return pkgs
+
+    def _summaries(self, *pkgs):
+        """ Generate a summary dict for each pkg as if it was the latest. """
+        return [PackageSummary(p).__json__() for p in pkgs]
+
     def test_upload(self):
         """ upload() saves package and uploads to storage """
         pkg = make_package(factory=DynamoPackage)
@@ -608,15 +667,288 @@ class TestDynamoCache(unittest.TestCase):
 
     def test_reload(self):
         """ reload_from_storage() inserts packages into the database """
-        keys = [
-            make_package(factory=DynamoPackage),
-            make_package('mypkg2', '1.3.4', 'my/other/path',
-                         factory=DynamoPackage),
+        pkgs = [
+            make_package('mypkg', '1.1', factory=DynamoPackage),
+            make_package('mypkg2', '1.3.4', factory=DynamoPackage),
+            make_package('mypkg2', '1.3.5', factory=DynamoPackage),
+            make_package('mypkg3', '7.11.13', factory=DynamoPackage),
         ]
-        self.storage.list.return_value = keys
+        self.db.save(pkgs[0])
+        self.db.save(pkgs[1])
+        self.storage.list.return_value = pkgs[1:]
+
         self.db.reload_from_storage()
-        all_pkgs = self.engine.scan(DynamoPackage).all()
-        self.assertItemsEqual(all_pkgs, keys)
+
+        self.assertItemsEqual(
+            self.storage.list.return_value,
+            self.engine.scan(DynamoPackage).all(),
+        )
+        self.assertEqual(
+            self._summaries(pkgs[2], pkgs[3]),
+            self.db.summary(),
+        )
+
+    def test_reload_stale_latest(self):
+        """ Summary gets updated if the latest package goes away """
+        pkgs = self._save_pkgs(
+            make_package('mypkg2', '1.3.4', factory=DynamoPackage),
+            make_package('mypkg2', '1.3.5', factory=DynamoPackage),
+        )
+        self.assertEqual(
+            self._summaries(pkgs[1]),
+            self.db.summary(),
+        )
+
+        new_pkgs = pkgs[:1]
+        self.storage.list.return_value = new_pkgs
+        self.db.reload_from_storage()
+
+        self.assertItemsEqual(
+            new_pkgs,
+            self.engine.scan(DynamoPackage).all(),
+        )
+        self.assertEqual(
+            self._summaries(pkgs[0]),
+            self.db.summary(),
+        )
+
+    def test_reload_same_filename_different_paths(self):
+        """ Given two packages with the same filename and same last_modified,
+        use the shortest path. """
+        filename = 'here.tgz'
+        now = datetime.utcnow().replace(tzinfo=UTC)
+        pkgs = [
+            make_package(
+                filename=filename,
+                path=p,
+                last_modified=now,
+                factory=DynamoPackage)
+            for p in (
+                filename,
+                'somewhere/far/from/' + filename,
+            )
+        ]
+
+        for p in pkgs:
+            self.db.clear_all()
+            self._save_pkgs(p)
+            self.storage.list.return_value = pkgs
+            self.db.reload_from_storage()
+
+            self.assertDictEqual(
+                pkgs[0].data,
+                self.db.fetch(filename).data,
+            )
+
+    def test_reload_same_filename_later_contender(self):
+        """Given two packages with the same filename, use the earliest one."""
+        # Since we didn't set last_modified, these will have ascending dates.
+        # That means the first one always wins.
+        filename = 'carrot-1.0.tgz'
+        pkgs = [
+            make_package(
+                filename=filename,
+                path=p,
+                factory=DynamoPackage)
+            for p in (
+                '0/' + filename,
+                '1/' + filename,
+            )
+        ]
+
+        for p in pkgs:
+            self.db.clear_all()
+            self._save_pkgs(p)
+            self.storage.list.return_value = pkgs
+            self.db.reload_from_storage()
+
+            self.assertDictEqual(
+                pkgs[0].data,
+                self.db.fetch(filename).data,
+            )
+
+    def test_reload_clobber_package_save(self):
+        """ Do nothing if someone else saves the same package while reloading """
+        pkgs = [
+            make_package('carrot', '1', factory=DynamoPackage),
+        ]
+        # Nothing on the cache
+        self.storage.list.return_value = list(pkgs)
+
+        with reload_in_another_thread(self.db):
+            self.db.save(pkgs[0])
+
+        self.assertItemsEqual(
+            pkgs,
+            self.engine.scan(DynamoPackage).all(),
+        )
+        self.assertEqual(
+            self._summaries(pkgs[0]),
+            self.db.summary(),
+        )
+
+    def test_reload_clobber_package_sync(self):
+        """ Do nothing if someone else saves a newer package while reloading """
+        # They are all going to have increasing last_modified
+        pkgs = [
+            make_package('carrot', '1', factory=DynamoPackage),
+            make_package('carrot', '1', factory=DynamoPackage),
+            make_package('carrot', '1', factory=DynamoPackage),
+        ]
+        self._save_pkgs(pkgs[0])
+        self.storage.list.return_value = [pkgs[1]]
+
+        with reload_in_another_thread(self.db):
+            self.db.save(pkgs[2])
+
+        self.assertItemsEqual(
+            [pkgs[2]],
+            self.engine.scan(DynamoPackage).all(),
+        )
+        self.assertEqual(
+            self._summaries(pkgs[2]),
+            self.db.summary(),
+        )
+
+    def test_reload_clobber_package_delete(self):
+        """ Do nothing if someone else deletes the same package """
+        pkgs = [
+            make_package('carrot', '1', factory=DynamoPackage),
+        ]
+        self._save_pkgs(pkgs[0])
+        self.storage.list.return_value = []
+
+        with reload_in_another_thread(self.db):
+            self.db.clear(pkgs[0])
+
+        self.assertItemsEqual(
+            [],
+            self.engine.scan(DynamoPackage).all(),
+        )
+        self.assertEqual(
+            [],
+            self.db.summary(),
+        )
+
+    def test_reload_clobber_summary_sync(self):
+        """ Don't clobber the summary if we detect an newer package midflight """
+        pkgs = [
+            make_package('carrot', '1', factory=DynamoPackage),
+            make_package('carrot', '3', factory=DynamoPackage),
+            make_package('carrot', '2', factory=DynamoPackage),
+        ]
+        self._save_pkgs(pkgs[0])
+        self.storage.list.return_value = [pkgs[0], pkgs[1]]
+
+        with reload_in_another_thread(self.db):
+            self.storage.list.return_value = list(pkgs)
+            # This also writes the updated summary
+            self.db.save(pkgs[2])
+
+        self.assertItemsEqual(
+            pkgs,
+            self.engine.scan(DynamoPackage).all(),
+        )
+        self.assertEqual(
+            [
+                {
+                    'name': pkgs[1].name,
+                    'stable': pkgs[1].version,
+                    'unstable': pkgs[1].version,
+                    'last_modified': pkgs[2].last_modified,
+                },
+            ],
+            self.db.summary(),
+        )
+
+    def test_reload_clobber_summary_sync_in_middle(self):
+        """ When seeing a set of packages for the first time, if we discover
+        summary conflicts while inserting, recalculate the summary """
+        pkgs = [
+            make_package('carrot', '1', factory=DynamoPackage),
+            make_package('carrot', '2', factory=DynamoPackage),
+            make_package('carrot', '3', factory=DynamoPackage),
+        ]
+        # Nothing on the cache
+        self.storage.list.return_value = list(pkgs)
+
+        with reload_in_another_thread(self.db):
+            self.db.save(pkgs[1])
+
+        self.assertItemsEqual(
+            pkgs,
+            self.engine.scan(DynamoPackage).all(),
+        )
+        self.assertEqual(
+            self._summaries(pkgs[2]),
+            self.db.summary(),
+        )
+
+    def test_reload_clobber_summary_sync_with_newer(self):
+        """ If someone uploads a newer package while we're inserting one of its
+        predecestors in the cache, recalculate the summary """
+        pkgs = [
+            make_package('carrot', '1', factory=DynamoPackage),
+            make_package('carrot', '2', factory=DynamoPackage),
+            make_package('carrot', '3', factory=DynamoPackage),
+        ]
+        self._save_pkgs(pkgs[0])
+        self.storage.list.return_value = [pkgs[0], pkgs[1]]
+
+        with reload_in_another_thread(self.db):
+            self.storage.list.return_value = list(pkgs)
+            self.db.save(pkgs[2])
+
+        self.assertItemsEqual(
+            pkgs,
+            self.engine.scan(DynamoPackage).all(),
+        )
+        self.assertEqual(
+            self._summaries(pkgs[2]),
+            self.db.summary(),
+        )
+
+    def test_reload_clobber_summary_delete_with_save(self):
+        """ Don't panic if a package to be deleted reappears """
+        pkgs = [
+            make_package('carrot', '1', factory=DynamoPackage),
+            make_package('carrot', '1', factory=DynamoPackage),
+        ]
+        self._save_pkgs(pkgs[0])
+        self.storage.list.return_value = []
+
+        with reload_in_another_thread(self.db):
+            self.storage.list.return_value = [pkgs[1]]
+            self.db.save(pkgs[1])
+
+        self.assertItemsEqual(
+            [pkgs[1]],
+            self.engine.scan(DynamoPackage).all(),
+        )
+        self.assertEqual(
+            self._summaries(pkgs[1]),
+            self.db.summary(),
+        )
+
+    def test_reload_clobber_summary_delete_with_delete(self):
+        """ Don't panic if a package to be deleted disappears """
+        pkgs = [
+            make_package('carrot', '1', factory=DynamoPackage),
+        ]
+        self._save_pkgs(pkgs[0])
+        self.storage.list.return_value = []
+
+        with reload_in_another_thread(self.db):
+            self.db.clear(pkgs[0])
+
+        self.assertItemsEqual(
+            [],
+            self.engine.scan(DynamoPackage).all(),
+        )
+        self.assertEqual(
+            [],
+            self.db.summary(),
+        )
 
     def test_fetch(self):
         """ fetch() retrieves a package from the database """
@@ -668,13 +1000,13 @@ class TestDynamoCache(unittest.TestCase):
                 'name': 'pkg1',
                 'stable': '1.1',
                 'unstable': '1.1.1a2',
-                'last_modified': p1.last_modified.replace(tzinfo=UTC),
+                'last_modified': p1.last_modified,
             },
             {
                 'name': 'pkg2',
                 'stable': None,
                 'unstable': '0.1dev2',
-                'last_modified': p2.last_modified.replace(tzinfo=UTC),
+                'last_modified': p2.last_modified,
             },
         ])
 
