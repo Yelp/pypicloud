@@ -83,6 +83,7 @@ if __name__ == "__main__":
                 'ppc-migrate = pypicloud.scripts:migrate_packages',
                 'ppc-export = pypicloud.scripts:export_access',
                 'ppc-import = pypicloud.scripts:import_access',
+                'ppc-refresh-path = pypicloud.scripts:refresh_path',
             ],
             'paste.app_factory': [
                 'main = pypicloud:main',

@@ -1,5 +1,6 @@
 """ Store package data in DynamoDB """
 import logging
+import posixpath
 import time
 from collections import namedtuple
 from datetime import datetime
@@ -309,3 +310,24 @@ class DynamoCache(ICache):
         else:
             summary.update_with(package)
         self.engine.sync(summary)
+
+    def reload_path(self, path):
+        filename = posixpath.basename(path)
+        cache_pkg = self.fetch(filename)
+        storage_pkg = self.storage.fetch(path, self.package_class)
+
+        if storage_pkg and cache_pkg:
+            if cache_pkg.data['path'] != path and \
+               _decide_between_versions(storage_pkg, cache_pkg) is cache_pkg:
+                LOG.warn(
+                    "File %r is not preferable over %r",
+                    path,
+                    cache_pkg.data['path'],
+                )
+                return
+
+        if cache_pkg:
+            self.clear(cache_pkg)
+
+        if storage_pkg:
+            self.save(storage_pkg)

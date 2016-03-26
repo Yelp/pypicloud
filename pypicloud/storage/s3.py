@@ -125,30 +125,45 @@ class S3Storage(IStorage):
             package.data['path'] = self.bucket_prefix + filename
         return package.data['path']
 
+    def fetch(self, key_name, factory=Package):
+        key = self.bucket.get_key(key_name)
+        if not key:
+            return None
+
+        return self._build_from_key(key, factory)
+
+    def _build_from_key(self, key, factory):
+        filename = posixpath.basename(key.key)
+        name = key.get_metadata('name')
+        version = key.get_metadata('version')
+
+        # We used to not store metadata. This is for backwards
+        # compatibility
+        if name is None or version is None:
+            try:
+                name, version = parse_filename(filename)
+            except ValueError:
+                LOG.warning("S3 file %s has no package name", key.key)
+                return None
+
+        return factory(
+            name,
+            version,
+            filename,
+            boto.utils.parse_ts(key.last_modified).replace(tzinfo=UTC),
+            path=key.key,
+        )
+
     def list(self, factory=Package):
         keys = self.bucket.list(self.bucket_prefix)
         for key in keys:
             # Moto doesn't send down metadata from bucket.list()
             if self.test:
                 key = self.bucket.get_key(key.key)
-            filename = posixpath.basename(key.key)
-            name = key.get_metadata('name')
-            version = key.get_metadata('version')
 
-            # We used to not store metadata. This is for backwards
-            # compatibility
-            if name is None or version is None:
-                try:
-                    name, version = parse_filename(filename)
-                except ValueError:
-                    LOG.warning("S3 file %s has no package name", key.key)
-                    continue
-
-            last_modified = boto.utils.parse_ts(key.last_modified).replace(tzinfo=UTC)
-
-            pkg = factory(name, version, filename, last_modified, path=key.key)
-
-            yield pkg
+            pkg = self._build_from_key(key, factory)
+            if pkg:
+                yield pkg
 
     def get_url(self, package):
         key = Key(self.bucket, self.get_path(package))
