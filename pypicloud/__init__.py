@@ -15,7 +15,7 @@ from .route import Root
 from .util import BetterScrapingLocator, dt2ts
 
 
-__version__ = '0.3.10'
+__version__ = '0.3.10post2'
 LOG = logging.getLogger(__name__)
 
 

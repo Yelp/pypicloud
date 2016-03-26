@@ -2,6 +2,10 @@ Changelog
 =========
 If you are upgrading an existing installation, read :ref:`the instructions <upgrade>`
 
+0.3.10post2
+-----------
+* Yelp internal release
+
 0.3.10
 ------
 * Feature: S3 backend setting ``storage.redirect_urls``
