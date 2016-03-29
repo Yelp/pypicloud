@@ -84,6 +84,7 @@ if __name__ == "__main__":
                 'ppc-export = pypicloud.scripts:export_access',
                 'ppc-import = pypicloud.scripts:import_access',
                 'ppc-refresh-path = pypicloud.scripts:refresh_path',
+                'ppc-reload-from-storage = pypicloud.scripts:reload_from_storage',
             ],
             'paste.app_factory': [
                 'main = pypicloud:main',
