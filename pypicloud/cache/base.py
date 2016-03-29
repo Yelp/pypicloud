@@ -8,7 +8,7 @@ from pyramid.settings import asbool
 import posixpath
 from pypicloud.models import Package
 from pypicloud.storage import get_storage_impl
-from pypicloud.util import parse_filename, normalize_name
+from pypicloud.util import parse_filename, normalize_name, EPOCH
 
 
 LOG = logging.getLogger(__name__)
@@ -66,7 +66,14 @@ class ICache(object):
         return self.storage.download_response(package)
 
     def reload_from_storage(self):
-        """ Make sure local database is populated with packages """
+        """
+        Make sure local database is populated with packages
+
+        The default implementation of this method is to clear the cache and
+        re-save all packages, but the various subclasses may override this for
+        a more performant mechanism.
+
+        """
         self.clear_all()
         packages = self.storage.list(self.package_class)
         for pkg in packages:
@@ -187,7 +194,7 @@ class ICache(object):
                 'name': name,
                 'stable': None,
                 'unstable': '0',
-                'last_modified': datetime.fromtimestamp(0),
+                'last_modified': EPOCH,
             }
             for package in self.all(name):
                 if not package.is_prerelease:
