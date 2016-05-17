@@ -4,7 +4,9 @@ import logging
 import posixpath
 from datetime import datetime
 from functools import wraps
+import re
 
+import six
 from distlib.locators import Locator, SimpleScrapingLocator
 from distlib.util import split_filename
 from pytz import UTC
@@ -37,7 +39,9 @@ def parse_filename(filename, name=None):
 
 def normalize_name(name):
     """ Normalize a python package name """
-    return name.lower().replace('-', '_')
+    # Lifted directly from PEP503:
+    # https://www.python.org/dev/peps/pep-0503/#id4
+    return re.sub(r"[-_.]+", "-", name).lower()
 
 
 class BetterScrapingLocator(SimpleScrapingLocator):
@@ -62,6 +66,33 @@ class BetterScrapingLocator(SimpleScrapingLocator):
             'pypi.python.org' in t.netloc,
             filename,
         )
+
+    def _get_project(self, name):
+        # We're overriding _get_project so that we can wrap the name with the
+        # NormalizeNameHackString. This is hopefully temporary. See this PR for
+        # more details:
+        # https://bitbucket.org/vinay.sajip/distlib/pull-requests/7/update-name-comparison-to-match-pep-503
+        return super(BetterScrapingLocator, self)._get_project(NormalizeNameHackString(name))
+
+
+class NormalizeNameHackString(six.text_type):
+    """
+    Super hacked wrapper around a string that runs normalize_name before doing
+    equality comparisons
+
+    """
+
+    def lower(self):
+        # lower() needs to return another NormalizeNameHackString in order to
+        # plumb this hack far enough into distlib.
+        lower = super(NormalizeNameHackString, self).lower()
+        return NormalizeNameHackString(lower)
+
+    def __eq__(self, other):
+        if isinstance(other, six.string_types):
+            return normalize_name(self) == normalize_name(other)
+        else:
+            return False
 
 
 def getdefaults(settings, *args):
