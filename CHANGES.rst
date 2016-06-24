@@ -2,6 +2,10 @@ Changelog
 =========
 If you are upgrading an existing installation, read :ref:`the instructions <upgrade>`
 
+0.4.0post2
+-----------
+* Yelp internal release
+
 0.4.0post1
 -----------
 * Yelp internal release
